@@ -205,3 +205,30 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Android
+*.iml
+.gradle/
+local.properties
+.idea/
+caches/
+logs/
+*.apk
+*.ap_
+*.dex
+*.class
+/bin/
+/gen/
+/out/
+/captures/
+/externalNativeBuild/
+.cxx/
+*.jks
+*.keystore
+google-services.json
+# Android Studio Navigation Editor
+.navigation/
+
+# OS
+.DS_Store
+Thumbs.db
