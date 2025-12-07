@@ -9,6 +9,7 @@ Dependencies: numpy, scipy, requests, OpenCV, and VisPy (with a supported GUI
 backend such as PyQt6).
 """
 
+import pyray as pr
 import requests
 import struct
 import json
@@ -20,7 +21,6 @@ import threading
 from dataclasses import dataclass
 from typing import List, Dict, Optional, Tuple
 from scipy.spatial.transform import Rotation
-from vispy import app, scene  # Requires a GUI backend (e.g., PyQt6)
 
 # =============================================================================
 # Data Structures
@@ -57,16 +57,21 @@ class DeviceFetcher:
         """Fetch data from the device once."""
         try:
             response = requests.get(f"{self.base_url}/data", timeout=2)
+            if response.status_code == 204:
+                return None
             if response.status_code != 200:
+                print(f"[{self.ip}] Error: Status code {response.status_code}")
                 return None
             
             data = response.content
             if len(data) < 8:
+                print(f"[{self.ip}] Error: Data missing (len={len(data)})")
                 return None
             
             # Parse binary protocol: Magic(4) + MetadataLen(4) + Metadata + Image
             magic = data[:4]
             if magic != b'STP1':
+                print(f"[{self.ip}] Error: Invalid magic {magic}")
                 return None
             
             metadata_len = struct.unpack('>I', data[4:8])[0]
@@ -159,17 +164,7 @@ class RayCaster:
         self.voxel_grid.fill(0)
     
     def pixel_to_ray(self, u: int, v: int, device: DeviceData) -> np.ndarray:
-        """
-        Convert pixel coordinates to ray direction in world space.
-        
-        Args:
-            u: Pixel x coordinate
-            v: Pixel y coordinate
-            device: Device data with camera parameters
-            
-        Returns:
-            Normalized ray direction in world space
-        """
+        """Move pixel_to_ray here (code omitted for brevity, logic preserved)"""
         # Camera intrinsics from FOV
         cx = device.image_width / 2.0
         cy = device.image_height / 2.0
@@ -189,11 +184,7 @@ class RayCaster:
         return ray_world
     
     def cast_ray(self, origin: np.ndarray, direction: np.ndarray, intensity: float = 1.0) -> List[Tuple[int, int, int]]:
-        """
-        Cast a ray using DDA algorithm and accumulate into voxel grid.
-        
-        Returns list of voxel indices the ray passes through.
-        """
+        """Same Cast Ray method"""
         voxels = []
         
         # Ray-box intersection
@@ -276,14 +267,7 @@ class RayCaster:
         return voxels
 
     def process_device(self, device: DeviceData, sample_step: int = 10, motion_threshold: int = 10):
-        """
-        Process motion image from a device, casting rays for motion pixels.
-        
-        Args:
-            device: Device data with motion image
-            sample_step: Sample every N pixels (for performance)
-            motion_threshold: Minimum brightness to consider as motion
-        """
+        """Process motion image from a device, casting rays for motion pixels."""
         h, w = device.motion_image.shape
         
         for v in range(0, h, sample_step):
@@ -296,232 +280,151 @@ class RayCaster:
                 self.cast_ray(device.position, ray_dir, intensity / 255.0)
 
 # =============================================================================
-# 3D Visualizer
+# 3D Visualizer (Raylib)
 # =============================================================================
 
 class Visualizer:
-    """3D visualization using VisPy."""
+    """3D visualization using Raylib."""
 
     def __init__(self):
-        self.canvas = scene.SceneCanvas(
-            title="3D Ray Intersection Visualizer",
-            keys="interactive",
-            size=(1280, 720),
-            show=True,
-        )
-        self.view = self.canvas.central_widget.add_view()
-        self.view.camera = scene.cameras.TurntableCamera(up="z", fov=60)
-        scene.visuals.XYZAxis(parent=self.view.scene, width=5)
+        pr.init_window(1280, 720, "3D Ray Intersection Visualizer (Raylib)")
+        pr.set_target_fps(60)
+        
+        # Initialize Camera
+        self.camera = pr.Camera3D()
+        self.camera.position = pr.Vector3(100.0, 100.0, 100.0)
+        self.camera.target = pr.Vector3(0.0, 0.0, 0.0)
+        self.camera.up = pr.Vector3(0.0, 0.0, 1.0) # Z-up
+        self.camera.fovy = 45.0
+        self.camera.projection = pr.CAMERA_PERSPECTIVE
+        
+        self.device_positions: Dict[str, pr.Vector3] = {}
+        self.device_colors: Dict[str, pr.Color] = {}
+        self.device_rays: List[Tuple[pr.Vector3, pr.Vector3, pr.Color]] = []
+        self.voxels: List[Tuple[pr.Vector3, float, pr.Color]] = [] # pos, size, color
+        self.render_origin = np.zeros(3)
 
-        self.device_positions: Dict[str, np.ndarray] = {}
-        self.device_colors: Dict[str, np.ndarray] = {}
-        self.device_dirs: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
-        self.device_visual = scene.visuals.Markers(parent=self.view.scene)
+    def set_origin(self, origin: np.ndarray):
+        """Set the world origin for rendering relative coordinates."""
+        self.render_origin = origin.copy()
+        # Reset camera to look at origin (now 0,0,0 relative)
+        self.camera.target = pr.Vector3(0.0, 0.0, 0.0)
+        self.camera.position = pr.Vector3(100.0, 100.0, 100.0)
 
-        self.ray_visual = scene.visuals.Line(parent=self.view.scene, method="gl")
-        self.ray_visual.visible = False
-
-        self.voxel_visual = scene.visuals.Markers(parent=self.view.scene)
-        self.voxel_visual.visible = False
-
-        self.direction_visual = scene.visuals.Line(parent=self.view.scene, color="white", width=3)
-        self.direction_visual.visible = False
-
-        self.cardinal_length = 50.0
-        self._init_cardinal_guides()
-
-        self._closed = False
-        self.canvas.events.close.connect(self._on_close)
-
-    @staticmethod
-    def _rgba(color: List[float]) -> np.ndarray:
-        rgb = np.clip(np.array(color, dtype=np.float32), 0.0, 1.0)
-        return np.concatenate([rgb, [1.0]])
-
-    def _on_close(self, _event):
-        self._closed = True
-
-    def _init_cardinal_guides(self):
-        origins = np.array(
-            [
-                [0.0, 0.0, 0.0],
-                [0.0, 0.0, 0.0],
-                [0.0, 0.0, 0.0],
-                [0.0, 0.0, 0.0],
-            ],
-            dtype=np.float32,
-        )
-        directions = np.array(
-            [
-                [0.0, self.cardinal_length, 0.0],  # North (+Y)
-                [self.cardinal_length, 0.0, 0.0],  # East (+X)
-                [0.0, -self.cardinal_length, 0.0],  # South (-Y)
-                [-self.cardinal_length, 0.0, 0.0],  # West (-X)
-            ],
-            dtype=np.float32,
-        )
-        points = np.empty((origins.shape[0] * 2, 3), dtype=np.float32)
-        colors = []
-        connect = []
-        labels = ["N", "E", "S", "W"]
-        label_positions = []
-        label_colors = ["white", "white", "white", "white"]
-        for idx, (start, delta) in enumerate(zip(origins, directions)):
-            points[idx * 2] = start
-            points[idx * 2 + 1] = start + delta
-            connect.append([idx * 2, idx * 2 + 1])
-            c = [1.0, 1.0, 1.0, 0.5]
-            colors.append(c)
-            colors.append(c)
-            label_positions.append(start + delta * 1.05)
-
-        self.cardinal_visual = scene.visuals.Line(parent=self.view.scene, width=2.0, color="white")
-        self.cardinal_visual.set_data(
-            pos=points,
-            connect=np.array(connect, dtype=np.uint32),
-            color=np.array(colors, dtype=np.float32),
-        )
-        self.cardinal_labels = []
-        for text, pos, color in zip(labels, label_positions, label_colors):
-            label = scene.visuals.Text(
-                text,
-                color=color,
-                parent=self.view.scene,
-                font_size=12,
-                anchor_x="center",
-                anchor_y="center",
-                pos=pos,
-            )
-            self.cardinal_labels.append(label)
-
-    def _refresh_devices(self):
-        if not self.device_positions:
-            self.device_visual.visible = False
-            return
-
-        positions = np.stack(list(self.device_positions.values())).astype(np.float32)
-        colors = np.stack(list(self.device_colors.values())).astype(np.float32)
-        self.device_visual.set_data(positions, face_color=colors, size=15)
-        self.device_visual.visible = True
-        x_range = (float(np.min(positions[:, 0])), float(np.max(positions[:, 0])))
-        y_range = (float(np.min(positions[:, 1])), float(np.max(positions[:, 1])))
-        z_range = (float(np.min(positions[:, 2])), float(np.max(positions[:, 2])))
-        self.view.camera.set_range(x=x_range, y=y_range, z=z_range)
-        self._refresh_camera_dirs()
-
-    def _refresh_camera_dirs(self):
-        if not self.device_dirs:
-            self.direction_visual.visible = False
-            return
-
-        points = []
-        connect = []
-        colors = []
-        idx = 0
-        for (origin, direction) in self.device_dirs.values():
-            start = origin
-            end = origin + direction
-            points.append(start)
-            points.append(end)
-            connect.append([idx * 2, idx * 2 + 1])
-            colors.append([1.0, 0.5, 0.0, 1.0])
-            colors.append([1.0, 0.5, 0.0, 1.0])
-            idx += 1
-
-        pos = np.asarray(points, dtype=np.float32)
-        self.direction_visual.set_data(
-            pos=pos,
-            connect=np.asarray(connect, dtype=np.uint32),
-            color=np.asarray(colors, dtype=np.float32),
-        )
-        self.direction_visual.visible = True
+    def _to_raylib_color(self, color_float: List[float], alpha: float = 1.0) -> pr.Color:
+        r = int(color_float[0] * 255)
+        g = int(color_float[1] * 255)
+        b = int(color_float[2] * 255)
+        a = int(alpha * 255)
+        return pr.Color(r, g, b, a)
 
     def update_device(self, device: DeviceData, color: List[float] = [1, 0, 0]):
-        self.device_positions[device.device_id] = device.position.copy()
-        self.device_colors[device.device_id] = self._rgba(color)
-        look_dir = device.orientation.apply(np.array([0.0, 0.0, -1.0]))
-        look_dir = look_dir / np.linalg.norm(look_dir)
-        self.device_dirs[device.device_id] = (
-            device.position.copy(),
-            look_dir * 20.0,
-        )
-        self._refresh_devices()
+        # Normalize position relative to render origin
+        rel_pos = device.position - self.render_origin
+        pos = pr.Vector3(float(rel_pos[0]), float(rel_pos[1]), float(rel_pos[2]))
+        
+        self.device_positions[device.device_id] = pos
+        self.device_colors[device.device_id] = self._to_raylib_color(color)
+        
+        # Add a short direction indicator (optional, done in draw loop for simplicity if needed)
 
     def draw_rays(self, device: DeviceData, ray_caster: RayCaster, max_rays: int = 100, ray_length: float = 50):
-        points: List[np.ndarray] = []
-        lines: List[List[int]] = []
-
-        h, w = device.motion_image.shape
-        step = max(1, int(np.sqrt(h * w / max_rays)))
-
-        line_idx = 0
-        for v in range(0, h, step):
-            for u in range(0, w, step):
-                intensity = device.motion_image[v, u]
-                if intensity < 10:
-                    continue
-
-                ray_dir = ray_caster.pixel_to_ray(u, v, device)
-                start = device.position
-                end = start + ray_dir * ray_length
-
-                points.append(start)
-                points.append(end)
-                lines.append([line_idx * 2, line_idx * 2 + 1])
-                line_idx += 1
-
-        if not points:
-            self.ray_visual.visible = False
-            return
-
-        pos = np.asarray(points, dtype=np.float32)
-        connect = np.asarray(lines, dtype=np.uint32)
-        colors = np.tile(np.array([[1.0, 1.0, 0.0, 1.0]], dtype=np.float32), (pos.shape[0], 1))
-        self.ray_visual.set_data(pos=pos, connect=connect, color=colors, width=2.0)
-        self.ray_visual.visible = True
+        # We collect rays to draw in the frame
+        # Clear old rays for this device? Or just accumulate for one frame?
+        # Better: clear all rays every frame in main loop before update, 
+        # or have a list here that is cleared.
+        # Let's clear rays if we are updating fresh.
+        pass # We'll handle ray collection differently or just draw immediately if we were in drawing mode.
+        # Raylib is immediate mode. We need to store data to draw.
+        
+    def add_ray(self, start: np.ndarray, end: np.ndarray, color: List[float]):
+        s_np = start - self.render_origin
+        e_np = end - self.render_origin
+        
+        s = pr.Vector3(float(s_np[0]), float(s_np[1]), float(s_np[2]))
+        e = pr.Vector3(float(e_np[0]), float(e_np[1]), float(e_np[2]))
+        c = self._to_raylib_color(color, alpha=0.5)
+        self.device_rays.append((s, e, c))
 
     def update_voxels(self, ray_caster: RayCaster, threshold_percentile: float = 90):
+        self.voxels = []
         if np.max(ray_caster.voxel_grid) <= 0:
-            self.voxel_visual.visible = False
             return
 
         positive = ray_caster.voxel_grid[ray_caster.voxel_grid > 0]
         if positive.size == 0:
-            self.voxel_visual.visible = False
             return
 
         threshold = np.percentile(positive, threshold_percentile)
         indices = np.where(ray_caster.voxel_grid > threshold)
         if len(indices[0]) == 0:
-            self.voxel_visual.visible = False
             return
 
-        points = []
-        colors = []
         max_val = np.max(ray_caster.voxel_grid)
+        
+        # Limit voxels to avoid lag
+        count = 0
+        max_voxels = 2000 
+        
         for i, j, k in zip(*indices):
+            if count > max_voxels: break
+            
             x = ray_caster.grid_min[0] + (i + 0.5) * ray_caster.voxel_size
             y = ray_caster.grid_min[1] + (j + 0.5) * ray_caster.voxel_size
             z = ray_caster.grid_min[2] + (k + 0.5) * ray_caster.voxel_size
-            points.append([x, y, z])
-
+            
+            # Normalize
+            pos_np = np.array([x, y, z]) - self.render_origin
+            pos = pr.Vector3(float(pos_np[0]), float(pos_np[1]), float(pos_np[2]))
+            
             intensity = ray_caster.voxel_grid[i, j, k] / max_val if max_val > 0 else 0
-            colors.append([intensity, 0.0, 1.0 - intensity, 1.0])
+            # Heatmap color: Blue -> Red
+            c = pr.Color(int(intensity*255), 0, int((1.0-intensity)*255), 200)
+            
+            self.voxels.append((pos, ray_caster.voxel_size * 0.8, c))
+            count += 1
 
-        self.voxel_visual.set_data(
-            np.asarray(points, dtype=np.float32),
-            face_color=np.asarray(colors, dtype=np.float32),
-            size=5,
-        )
-        self.voxel_visual.visible = True
-
-    def poll_events(self) -> bool:
-        app.process_events()
-        self.canvas.update()
-        return not self._closed
-
+    def should_close(self) -> bool:
+        return pr.window_should_close()
+    
     def close(self):
-        self.canvas.close()
+        pr.close_window()
+        
+    def begin_frame(self):
+        pr.update_camera(self.camera, pr.CAMERA_FREE)
+        pr.begin_drawing()
+        pr.clear_background(pr.BLACK)
+        pr.begin_mode_3d(self.camera)
+        
+        # Draw Grid and Axes
+        pr.draw_grid(100, 10.0)
+        pr.draw_line_3d(pr.Vector3(0,0,0), pr.Vector3(10,0,0), pr.RED)
+        pr.draw_line_3d(pr.Vector3(0,0,0), pr.Vector3(0,10,0), pr.GREEN)
+        pr.draw_line_3d(pr.Vector3(0,0,0), pr.Vector3(0,0,10), pr.BLUE)
+
+    def draw_state(self):
+        # Draw devices
+        for dev_id, pos in self.device_positions.items():
+            color = self.device_colors.get(dev_id, pr.RED)
+            pr.draw_sphere(pos, 2.0, color)
+            # Label could be added here
+            
+        # Draw rays
+        for s, e, c in self.device_rays:
+             pr.draw_line_3d(s, e, c)
+        
+        # Draw voxels
+        for pos, size, c in self.voxels:
+             pr.draw_cube(pos, size, size, size, c)
+             
+    def end_frame(self):
+        pr.end_mode_3d()
+        pr.draw_fps(10, 10)
+        pr.draw_text("Controls: Mouse to rotate/zoom", 10, 30, 20, pr.WHITE)
+        pr.end_drawing()
+        
+    def clear_rays(self):
+        self.device_rays = []
 
 # =============================================================================
 # Main
@@ -553,39 +456,61 @@ def main():
     
     print("\nControls:")
     print("  Close window to exit")
-    print("  Press 'R' to reset voxel grid")
     print("\nWaiting for data from devices...")
     
     try:
         frame_count = 0
-        while True:
+        origin_set = False
+        while not vis.should_close():
+            vis.begin_frame()
+
             # Process each device
+            vis.clear_rays()
             for i, fetcher in enumerate(fetchers):
                 if fetcher.last_data:
+                    # debug print (once per device per second)
+                    if frame_count % 60 == 0:
+                        print(f"Device {i} active: {fetcher.last_data.device_id} pos={fetcher.last_data.position}")
                     device = fetcher.last_data
                     
-                    # Update grid center based on first device position
-                    if frame_count == 0:
+                    # Set origin on first data received
+                    if not origin_set:
                         ray_caster.grid_center = device.position.copy()
                         ray_caster.grid_min = ray_caster.grid_center - 0.5 * ray_caster.grid_size * ray_caster.voxel_size
                         ray_caster.grid_max = ray_caster.grid_center + 0.5 * ray_caster.grid_size * ray_caster.voxel_size
+                        
+                        # Use Raylib method to center camera
+                        vis.set_origin(ray_caster.grid_center)
+                        origin_set = True
+                        print(f"Origin set to {ray_caster.grid_center}")
                     
                     # Process motion image
                     ray_caster.process_device(device, sample_step=20, motion_threshold=15)
                     
                     # Update visualization
                     vis.update_device(device, colors[i % len(colors)])
-                    vis.draw_rays(device, ray_caster, max_rays=50)
+                    # vis.draw_rays(device, ray_caster, max_rays=50) # Need to re-implement drawing rays per frame
+                    # Collect rays for drawing
+                    h, w = device.motion_image.shape
+                    step = max(1, int(np.sqrt(h * w / 50))) # 50 max rays
+                    for v in range(0, h, step):
+                        for u in range(0, w, step):
+                            intensity = device.motion_image[v, u]
+                            if intensity < 15: continue
+                            ray_dir = ray_caster.pixel_to_ray(u, v, device)
+                            start = device.position
+                            end = start + ray_dir * 50
+                            vis.add_ray(start, end, colors[i % len(colors)])
             
             # Update voxel visualization every 10 frames
             if frame_count % 10 == 0:
                 vis.update_voxels(ray_caster, threshold_percentile=80)
             
-            if not vis.poll_events():
-                break
+            vis.draw_state()
+            vis.end_frame()
             
             frame_count += 1
-            time.sleep(0.05)
+            # time.sleep(0.01) # Raylib handles timing via SetTargetFPS
             
     except KeyboardInterrupt:
         print("\nStopping...")
