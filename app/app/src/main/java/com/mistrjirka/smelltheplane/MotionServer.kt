@@ -30,7 +30,7 @@ object MotionSettings {
     @Volatile var availableResolutions: List<Size> = emptyList()
     @Volatile var currentResolution: Size? = null
 
-    var onResolutionChanged: (() -> Unit)? = null
+    @Volatile var onResolutionChanged: (() -> Unit)? = null
 }
 
 data class ResolutionRequest(val width: Int, val height: Int)
@@ -47,8 +47,7 @@ object MotionServer {
 
     private val gson = Gson()
     @Volatile private var server: ApplicationEngine? = null
-    @Volatile private var currentMetadata: MotionData? = null
-    @Volatile private var currentImageBytes: ByteArray? = null
+    @Volatile private var currentData: Pair<MotionData, ByteArray>? = null
 
     fun start() {
         synchronized(this) {
@@ -57,10 +56,10 @@ object MotionServer {
             val engine = embeddedServer(Netty, port = PORT) {
                 routing {
                     get("/data") {
-                        val metadata = currentMetadata
-                        val image = currentImageBytes
+                        val data = currentData
 
-                        if (metadata != null && image != null) {
+                        if (data != null) {
+                            val (metadata, image) = data
                             val metadataJson = gson.toJson(metadata).toByteArray(Charsets.UTF_8)
                             val magicBytes = "STP1".toByteArray(Charsets.UTF_8)
                             val metadataLength = ByteBuffer.allocate(4)
@@ -169,8 +168,7 @@ object MotionServer {
     }
 
     fun updateData(metadata: MotionData, imageBytes: ByteArray) {
-        currentMetadata = metadata
-        currentImageBytes = imageBytes
+        currentData = Pair(metadata, imageBytes)
     }
 
     fun getIpAddress(): String {

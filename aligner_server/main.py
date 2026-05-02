@@ -19,7 +19,8 @@ import time
 import sys
 import threading
 from dataclasses import dataclass
-from typing import List, Dict, Optional, Tuple
+from collections import deque
+from typing import List, Dict, Optional, Tuple, Callable
 from scipy.spatial.transform import Rotation
 
 # =============================================================================
@@ -37,6 +38,45 @@ class DeviceData:
     image_width: int
     image_height: int
     motion_image: np.ndarray
+    sensor_orientation: int = 0  # Camera sensor mounting rotation (degrees), typically 90 or 270
+    location_accuracy: float = 0.0  # GPS accuracy (meters)
+
+# =============================================================================
+# Camera Model
+# =============================================================================
+
+class CameraModel:
+    """Camera geometry: pixel-to-ray projection and angular uncertainty."""
+    
+    @staticmethod
+    def pixel_to_ray(u: int, v: int, device: DeviceData) -> np.ndarray:
+        """Convert pixel coordinates to a unit ray direction in world space."""
+        cx = device.image_width / 2.0
+        cy = device.image_height / 2.0
+        fx = cx / np.tan(np.radians(device.fov_horizontal / 2))
+        fy = cy / np.tan(np.radians(device.fov_vertical / 2))
+        
+        x = (u - cx) / fx
+        y = -(v - cy) / fy  # Flip Y
+        z = -1.0
+        
+        ray_cam = np.array([x, y, z])
+        ray_cam = ray_cam / np.linalg.norm(ray_cam)
+        
+        # Compensate for camera sensor physical mounting offset
+        if device.sensor_orientation != 0:
+            sensor_rot = Rotation.from_euler('z', -np.radians(device.sensor_orientation))
+            ray_cam = sensor_rot.apply(ray_cam)
+        
+        # Transform to world space
+        return device.orientation.apply(ray_cam)
+    
+    @staticmethod
+    def angular_uncertainty(device: DeviceData) -> float:
+        """Angular width of one pixel in degrees (used for ray cone spread)."""
+        pixel_angle_h = device.fov_horizontal / device.image_width
+        pixel_angle_v = device.fov_vertical / device.image_height
+        return max(pixel_angle_h, pixel_angle_v)
 
 # =============================================================================
 # Device Fetcher
@@ -44,6 +84,8 @@ class DeviceData:
 
 class DeviceFetcher:
     """Fetches data from a phone device."""
+    
+    reference_latitude: Optional[float] = None
     
     def __init__(self, ip: str, port: int = 8080):
         self.ip = ip
@@ -96,10 +138,18 @@ class DeviceFetcher:
             lat = loc.get('latitude', 0)
             lon = loc.get('longitude', 0)
             alt = loc.get('altitude', 0)
+            accuracy = loc.get('accuracy', 0.0)
+            
+            # Use a shared reference latitude so all devices share the same
+            # longitudinal scale factor, keeping the coordinate frame Euclidean.
+            if DeviceFetcher.reference_latitude is None and lat != 0:
+                DeviceFetcher.reference_latitude = lat
+            
+            ref_lat = DeviceFetcher.reference_latitude if DeviceFetcher.reference_latitude is not None else lat
             
             # Simple conversion (meters from reference)
             # 1 degree lat ≈ 111km, 1 degree lon ≈ 111km * cos(lat)
-            x = lon * 111000 * np.cos(np.radians(lat))
+            x = lon * 111000 * np.cos(np.radians(ref_lat))
             y = lat * 111000
             z = alt
             
@@ -116,7 +166,9 @@ class DeviceFetcher:
                 fov_vertical=cam.get('fovVertical', 45),
                 image_width=cam.get('imageWidth', 1920),
                 image_height=cam.get('imageHeight', 1080),
-                motion_image=motion_image
+                motion_image=motion_image,
+                sensor_orientation=cam.get('sensorOrientation', 0),
+                location_accuracy=accuracy
             )
         except Exception as e:
             print(f"Error fetching from {self.ip}: {e}")
@@ -142,112 +194,188 @@ class DeviceFetcher:
             time.sleep(0.05)  # ~20 Hz
 
 # =============================================================================
-# Ray Caster (ported from ray_voxel.cpp)
+# Probability Grid — sliding-window volume accumulation
 # =============================================================================
 
-class RayCaster:
-    """Casts rays into a 3D voxel grid."""
+class ProbabilityGrid:
+    """Sliding-window probability field for volume intersection.
     
-    def __init__(self, grid_size: int = 100, voxel_size: float = 1.0, grid_center: np.ndarray = None):
+    Accumulates per-frame sparse voxel contributions into a fixed-size deque.
+    The probability field is the sum of all active frames in the window.
+    """
+    
+    def __init__(self, grid_size: int = 100, voxel_size: float = 1.0,
+                 grid_center: np.ndarray = None, window_size: int = 30):
         self.grid_size = grid_size
         self.voxel_size = voxel_size
         self.grid_center = grid_center if grid_center is not None else np.zeros(3)
-        self.voxel_grid = np.zeros((grid_size, grid_size, grid_size), dtype=np.float32)
+        self.window_size = window_size
+        self.frame_buffer: deque = deque(maxlen=window_size)
+        self._field = np.zeros((grid_size, grid_size, grid_size), dtype=np.float32)
         
-        # Grid bounds
         half_size = 0.5 * grid_size * voxel_size
         self.grid_min = self.grid_center - half_size
         self.grid_max = self.grid_center + half_size
     
-    def reset(self):
-        """Reset the voxel grid."""
-        self.voxel_grid.fill(0)
+    def add_frame(self, sparse_voxels: List[Tuple[int, int, int, float]]):
+        """Push a new frame's sparse voxel contributions onto the sliding window."""
+        self.frame_buffer.append(sparse_voxels)
     
-    def pixel_to_ray(self, u: int, v: int, device: DeviceData) -> np.ndarray:
-        """Move pixel_to_ray here (code omitted for brevity, logic preserved)"""
-        # Camera intrinsics from FOV
-        cx = device.image_width / 2.0
-        cy = device.image_height / 2.0
-        fx = cx / np.tan(np.radians(device.fov_horizontal / 2))
-        fy = cy / np.tan(np.radians(device.fov_vertical / 2))
-        
-        # Pixel to camera space (camera looks down -Z)
-        x = (u - cx) / fx
-        y = -(v - cy) / fy  # Flip Y
-        z = -1.0
-        
-        ray_cam = np.array([x, y, z])
-        ray_cam = ray_cam / np.linalg.norm(ray_cam)
-        
-        # Transform to world space
-        ray_world = device.orientation.apply(ray_cam)
-        return ray_world
+    def get_probability(self) -> np.ndarray:
+        """Return the summed probability field from all frames in the window."""
+        self._field.fill(0)
+        for frame in self.frame_buffer:
+            for ix, iy, iz, prob in frame:
+                self._field[ix, iy, iz] += prob
+        return self._field
     
-    def cast_ray(self, origin: np.ndarray, direction: np.ndarray, intensity: float = 1.0) -> List[Tuple[int, int, int]]:
-        """Same Cast Ray method"""
-        voxels = []
+    def set_center(self, center: np.ndarray):
+        """Move the grid to a new center."""
+        self.grid_center = center.copy()
+        half_size = 0.5 * self.grid_size * self.voxel_size
+        self.grid_min = self.grid_center - half_size
+        self.grid_max = self.grid_center + half_size
+    
+    def clear(self):
+        """Clear all frames from the sliding window."""
+        self.frame_buffer.clear()
+
+# =============================================================================
+# Cone Caster — volume intersection ray marching
+# =============================================================================
+
+class ConeCaster:
+    """Casts probability cones through a voxel grid.
+    
+    At each DDA step along the ray, a cone cross-section grows with distance.
+    GPS accuracy defines the base radius, angular pixel uncertainty adds spread
+    with distance. Voxels within the cone receive Gaussian-weighted probability.
+    """
+    
+    # Precomputed sphere-offset cache: radius -> list of (dx, dy, dz)
+    _offset_cache: Dict[int, List[Tuple[int, int, int]]] = {}
+    
+    def __init__(self, prob_grid: ProbabilityGrid):
+        self.grid = prob_grid
+    
+    @classmethod
+    def _sphere_offsets(cls, radius: int) -> List[Tuple[int, int, int]]:
+        if radius not in cls._offset_cache:
+            offsets = []
+            r2 = radius * radius
+            for dx in range(-radius, radius + 1):
+                dx2 = dx * dx
+                for dy in range(-radius, radius + 1):
+                    dy2 = dy * dy
+                    d2_xy = dx2 + dy2
+                    if d2_xy > r2:
+                        continue
+                    for dz in range(-radius, radius + 1):
+                        if d2_xy + dz * dz <= r2:
+                            offsets.append((dx, dy, dz))
+            cls._offset_cache[radius] = offsets
+        return cls._offset_cache[radius]
+    
+    def cast_cone(self, origin: np.ndarray, direction: np.ndarray,
+                  device: DeviceData, intensity: float = 1.0) -> List[Tuple[int, int, int, float]]:
+        """Cast a probability cone from origin along direction.
         
-        # Ray-box intersection
+        Returns list of (ix, iy, iz, probability) for voxels within the cone.
+        """
+        sparse = []
+        gps_uncertainty = device.location_accuracy  # meters at origin
+        angular_uncertainty = np.radians(CameraModel.angular_uncertainty(device))
+        
+        o = origin
+        d = direction
+        gmin = self.grid.grid_min
+        gmax = self.grid.grid_max
+        vs = self.grid.voxel_size
+        gs = self.grid.grid_size
+        max_cone_radius_voxels = 5  # cap spiral to keep perf reasonable
+        
+        # ---- ray-box intersection ----
         t_min = 0.0
         t_max = float('inf')
-        
-        for i in range(3):
-            if abs(direction[i]) < 1e-12:
-                if origin[i] < self.grid_min[i] or origin[i] > self.grid_max[i]:
-                    return voxels
+        for axis in range(3):
+            if abs(d[axis]) < 1e-12:
+                if o[axis] < gmin[axis] or o[axis] > gmax[axis]:
+                    return sparse
             else:
-                t1 = (self.grid_min[i] - origin[i]) / direction[i]
-                t2 = (self.grid_max[i] - origin[i]) / direction[i]
+                t1 = (gmin[axis] - o[axis]) / d[axis]
+                t2 = (gmax[axis] - o[axis]) / d[axis]
                 t_near = min(t1, t2)
                 t_far = max(t1, t2)
                 t_min = max(t_min, t_near)
                 t_max = min(t_max, t_far)
                 if t_min > t_max:
-                    return voxels
+                    return sparse
         
         if t_min < 0:
             t_min = 0
         
-        # Start position
-        start = origin + t_min * direction
-        fx = (start[0] - self.grid_min[0]) / self.voxel_size
-        fy = (start[1] - self.grid_min[1]) / self.voxel_size
-        fz = (start[2] - self.grid_min[2]) / self.voxel_size
-        
+        # ---- start voxel ----
+        start = o + t_min * d
+        fx = (start[0] - gmin[0]) / vs
+        fy = (start[1] - gmin[1]) / vs
+        fz = (start[2] - gmin[2]) / vs
         ix, iy, iz = int(fx), int(fy), int(fz)
-        if not (0 <= ix < self.grid_size and 0 <= iy < self.grid_size and 0 <= iz < self.grid_size):
-            return voxels
+        if not (0 <= ix < gs and 0 <= iy < gs and 0 <= iz < gs):
+            return sparse
         
-        # Step direction
-        step_x = 1 if direction[0] >= 0 else -1
-        step_y = 1 if direction[1] >= 0 else -1
-        step_z = 1 if direction[2] >= 0 else -1
+        # ---- step direction ----
+        step_x = 1 if d[0] >= 0 else -1
+        step_y = 1 if d[1] >= 0 else -1
+        step_z = 1 if d[2] >= 0 else -1
         
-        # t_delta: how far along ray to cross one voxel
-        t_delta_x = self.voxel_size / abs(direction[0]) if abs(direction[0]) > 1e-12 else float('inf')
-        t_delta_y = self.voxel_size / abs(direction[1]) if abs(direction[1]) > 1e-12 else float('inf')
-        t_delta_z = self.voxel_size / abs(direction[2]) if abs(direction[2]) > 1e-12 else float('inf')
+        # ---- t_delta ----
+        inv_dx = 1.0 / abs(d[0]) if abs(d[0]) > 1e-12 else float('inf')
+        inv_dy = 1.0 / abs(d[1]) if abs(d[1]) > 1e-12 else float('inf')
+        inv_dz = 1.0 / abs(d[2]) if abs(d[2]) > 1e-12 else float('inf')
+        t_delta_x = vs * inv_dx
+        t_delta_y = vs * inv_dy
+        t_delta_z = vs * inv_dz
         
-        # t_max: distance to next voxel boundary
-        next_x = (ix + (1 if step_x > 0 else 0)) * self.voxel_size + self.grid_min[0]
-        next_y = (iy + (1 if step_y > 0 else 0)) * self.voxel_size + self.grid_min[1]
-        next_z = (iz + (1 if step_z > 0 else 0)) * self.voxel_size + self.grid_min[2]
-        
-        t_max_x = (next_x - origin[0]) / direction[0] if abs(direction[0]) > 1e-12 else float('inf')
-        t_max_y = (next_y - origin[1]) / direction[1] if abs(direction[1]) > 1e-12 else float('inf')
-        t_max_z = (next_z - origin[2]) / direction[2] if abs(direction[2]) > 1e-12 else float('inf')
+        # ---- t_max ----
+        next_x = (ix + (1 if step_x > 0 else 0)) * vs + gmin[0]
+        next_y = (iy + (1 if step_y > 0 else 0)) * vs + gmin[1]
+        next_z = (iz + (1 if step_z > 0 else 0)) * vs + gmin[2]
+        t_max_x = (next_x - o[0]) / d[0] if abs(d[0]) > 1e-12 else float('inf')
+        t_max_y = (next_y - o[1]) / d[1] if abs(d[1]) > 1e-12 else float('inf')
+        t_max_z = (next_z - o[2]) / d[2] if abs(d[2]) > 1e-12 else float('inf')
         
         t_current = t_min
-        max_steps = self.grid_size * 3  # Limit iterations
+        max_steps = gs * 3
         
         for _ in range(max_steps):
-            if not (0 <= ix < self.grid_size and 0 <= iy < self.grid_size and 0 <= iz < self.grid_size):
+            if not (0 <= ix < gs and 0 <= iy < gs and 0 <= iz < gs):
                 break
             
-            voxels.append((ix, iy, iz))
-            self.voxel_grid[ix, iy, iz] += intensity
+            # ---- cone radius at this step ----
+            distance = t_current
+            cone_radius = gps_uncertainty + distance * np.tan(angular_uncertainty)
+            radius_voxels = int(cone_radius / vs)
+            if radius_voxels > max_cone_radius_voxels:
+                radius_voxels = max_cone_radius_voxels
             
-            # Move to next voxel
+            # ---- Gaussian-weighted probability to cone cross-section ----
+            sigma = max(1.0, cone_radius / 2.0) * vs  # in voxel-unit space
+            sigma_sq_2 = 2.0 * sigma * sigma
+            
+            if radius_voxels == 0:
+                sparse.append((ix, iy, iz, intensity))
+            else:
+                offsets = self._sphere_offsets(radius_voxels)
+                for dx, dy, dz in offsets:
+                    nx, ny, nz = ix + dx, iy + dy, iz + dz
+                    if not (0 <= nx < gs and 0 <= ny < gs and 0 <= nz < gs):
+                        continue
+                    d2 = float(dx * dx + dy * dy + dz * dz) * vs * vs
+                    weight = intensity * np.exp(-d2 / sigma_sq_2)
+                    if weight > 0.001:
+                        sparse.append((nx, ny, nz, weight))
+            
+            # ---- DDA step ----
             if t_max_x < t_max_y and t_max_x < t_max_z:
                 ix += step_x
                 t_current = t_max_x
@@ -264,10 +392,39 @@ class RayCaster:
             if t_current > t_max:
                 break
         
-        return voxels
+        return sparse
 
-    def process_device(self, device: DeviceData, sample_step: int = 10, motion_threshold: int = 10):
-        """Process motion image from a device, casting rays for motion pixels."""
+# =============================================================================
+# Ray Caster — orchestrates camera, cone casting, and probability
+# =============================================================================
+
+class RayCaster:
+    """Orchestrates volume intersection: camera model, cone casting, probability grid."""
+    
+    def __init__(self, grid_size: int = 100, voxel_size: float = 1.0,
+                 grid_center: np.ndarray = None, window_size: int = 30):
+        self.grid_size = grid_size
+        self.voxel_size = voxel_size
+        self.prob_grid = ProbabilityGrid(grid_size, voxel_size, grid_center, window_size)
+        self.cone_caster = ConeCaster(self.prob_grid)
+        # Backwards-compatible aliases for Visualizer
+        self.grid_center = self.prob_grid.grid_center
+        self.grid_min = self.prob_grid.grid_min
+        self.grid_max = self.prob_grid.grid_max
+    
+    def reset(self):
+        """Reset probability for a new frame (clear raw accumulator, not the window)."""
+        pass  # per-frame sparse list managed by caller
+    
+    def process_device(self, device: DeviceData, sample_step: int = 10,
+                       motion_threshold: int = 10,
+                       on_ray: Optional[Callable[[np.ndarray, np.ndarray, float], None]] = None
+                       ) -> List[Tuple[int, int, int, float]]:
+        """Process motion image, cast cones for each motion pixel.
+        
+        Returns sparse voxel list for this device's frame contribution.
+        """
+        sparse = []
         h, w = device.motion_image.shape
         
         for v in range(0, h, sample_step):
@@ -276,8 +433,18 @@ class RayCaster:
                 if intensity < motion_threshold:
                     continue
                 
-                ray_dir = self.pixel_to_ray(u, v, device)
-                self.cast_ray(device.position, ray_dir, intensity / 255.0)
+                ray_dir = CameraModel.pixel_to_ray(u, v, device)
+                cone = self.cone_caster.cast_cone(device.position, ray_dir,
+                                                   device, intensity / 255.0)
+                sparse.extend(cone)
+                if on_ray:
+                    on_ray(device.position, ray_dir, intensity / 255.0)
+        
+        return sparse
+    
+    def get_probability_field(self) -> np.ndarray:
+        """Return the current summed probability field from the sliding window."""
+        return self.prob_grid.get_probability()
 
 # =============================================================================
 # 3D Visualizer (Raylib)
@@ -328,15 +495,6 @@ class Visualizer:
         
         # Add a short direction indicator (optional, done in draw loop for simplicity if needed)
 
-    def draw_rays(self, device: DeviceData, ray_caster: RayCaster, max_rays: int = 100, ray_length: float = 50):
-        # We collect rays to draw in the frame
-        # Clear old rays for this device? Or just accumulate for one frame?
-        # Better: clear all rays every frame in main loop before update, 
-        # or have a list here that is cleared.
-        # Let's clear rays if we are updating fresh.
-        pass # We'll handle ray collection differently or just draw immediately if we were in drawing mode.
-        # Raylib is immediate mode. We need to store data to draw.
-        
     def add_ray(self, start: np.ndarray, end: np.ndarray, color: List[float]):
         s_np = start - self.render_origin
         e_np = end - self.render_origin
@@ -346,41 +504,40 @@ class Visualizer:
         c = self._to_raylib_color(color, alpha=0.5)
         self.device_rays.append((s, e, c))
 
-    def update_voxels(self, ray_caster: RayCaster, threshold_percentile: float = 90):
+    def update_voxels(self, prob_field: np.ndarray, ray_caster: RayCaster,
+                       threshold_percentile: float = 90):
         self.voxels = []
-        if np.max(ray_caster.voxel_grid) <= 0:
+        max_val = np.max(prob_field)
+        if max_val <= 0:
             return
 
-        positive = ray_caster.voxel_grid[ray_caster.voxel_grid > 0]
+        positive = prob_field[prob_field > 0]
         if positive.size == 0:
             return
 
         threshold = np.percentile(positive, threshold_percentile)
-        indices = np.where(ray_caster.voxel_grid > threshold)
+        indices = np.where(prob_field > threshold)
         if len(indices[0]) == 0:
             return
 
-        max_val = np.max(ray_caster.voxel_grid)
-        
         # Limit voxels to avoid lag
         count = 0
-        max_voxels = 2000 
-        
+        max_voxels = 2000
+
         for i, j, k in zip(*indices):
-            if count > max_voxels: break
-            
+            if count > max_voxels:
+                break
+
             x = ray_caster.grid_min[0] + (i + 0.5) * ray_caster.voxel_size
             y = ray_caster.grid_min[1] + (j + 0.5) * ray_caster.voxel_size
             z = ray_caster.grid_min[2] + (k + 0.5) * ray_caster.voxel_size
-            
-            # Normalize
+
             pos_np = np.array([x, y, z]) - self.render_origin
             pos = pr.Vector3(float(pos_np[0]), float(pos_np[1]), float(pos_np[2]))
-            
-            intensity = ray_caster.voxel_grid[i, j, k] / max_val if max_val > 0 else 0
-            # Heatmap color: Blue -> Red
-            c = pr.Color(int(intensity*255), 0, int((1.0-intensity)*255), 200)
-            
+
+            intensity = prob_field[i, j, k] / max_val
+            c = pr.Color(int(intensity * 255), 0, int((1.0 - intensity) * 255), 200)
+
             self.voxels.append((pos, ray_caster.voxel_size * 0.8, c))
             count += 1
 
@@ -464,53 +621,51 @@ def main():
         while not vis.should_close():
             vis.begin_frame()
 
-            # Process each device
-            vis.clear_rays()
+            # Collect all sparse voxel contributions for this frame
+            all_sparse: List[Tuple[int, int, int, float]] = []
+            
             for i, fetcher in enumerate(fetchers):
                 if fetcher.last_data:
-                    # debug print (once per device per second)
-                    if frame_count % 60 == 0:
-                        print(f"Device {i} active: {fetcher.last_data.device_id} pos={fetcher.last_data.position}")
                     device = fetcher.last_data
+                    
+                    if frame_count % 60 == 0:
+                        print(f"Device {i} active: {device.device_id} pos={device.position}")
                     
                     # Set origin on first data received
                     if not origin_set:
-                        ray_caster.grid_center = device.position.copy()
-                        ray_caster.grid_min = ray_caster.grid_center - 0.5 * ray_caster.grid_size * ray_caster.voxel_size
-                        ray_caster.grid_max = ray_caster.grid_center + 0.5 * ray_caster.grid_size * ray_caster.voxel_size
-                        
-                        # Use Raylib method to center camera
+                        ray_caster.prob_grid.set_center(device.position.copy())
+                        # Update backwards-compat aliases
+                        ray_caster.grid_center = ray_caster.prob_grid.grid_center
+                        ray_caster.grid_min = ray_caster.prob_grid.grid_min
+                        ray_caster.grid_max = ray_caster.prob_grid.grid_max
                         vis.set_origin(ray_caster.grid_center)
                         origin_set = True
                         print(f"Origin set to {ray_caster.grid_center}")
                     
-                    # Process motion image
-                    ray_caster.process_device(device, sample_step=20, motion_threshold=15)
+                    # Process motion image: cast cones and collect rays
+                    vis.clear_rays()
+                    def collect_ray(origin, direction, intensity):
+                        end = origin + direction * 50
+                        vis.add_ray(origin, end, colors[i % len(colors)])
+                    sparse = ray_caster.process_device(device, sample_step=20,
+                                                        motion_threshold=15,
+                                                        on_ray=collect_ray)
+                    all_sparse.extend(sparse)
                     
-                    # Update visualization
                     vis.update_device(device, colors[i % len(colors)])
-                    # vis.draw_rays(device, ray_caster, max_rays=50) # Need to re-implement drawing rays per frame
-                    # Collect rays for drawing
-                    h, w = device.motion_image.shape
-                    step = max(1, int(np.sqrt(h * w / 50))) # 50 max rays
-                    for v in range(0, h, step):
-                        for u in range(0, w, step):
-                            intensity = device.motion_image[v, u]
-                            if intensity < 15: continue
-                            ray_dir = ray_caster.pixel_to_ray(u, v, device)
-                            start = device.position
-                            end = start + ray_dir * 50
-                            vis.add_ray(start, end, colors[i % len(colors)])
+            
+            # Commit this frame's contributions to the sliding window
+            ray_caster.prob_grid.add_frame(all_sparse)
             
             # Update voxel visualization every 10 frames
             if frame_count % 10 == 0:
-                vis.update_voxels(ray_caster, threshold_percentile=80)
+                prob_field = ray_caster.get_probability_field()
+                vis.update_voxels(prob_field, ray_caster, threshold_percentile=80)
             
             vis.draw_state()
             vis.end_frame()
             
             frame_count += 1
-            # time.sleep(0.01) # Raylib handles timing via SetTargetFPS
             
     except KeyboardInterrupt:
         print("\nStopping...")

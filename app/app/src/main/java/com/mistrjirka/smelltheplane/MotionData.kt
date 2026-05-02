@@ -27,5 +27,6 @@ data class CameraData(
     val fovHorizontal: Float,  // Horizontal FOV in degrees
     val fovVertical: Float,    // Vertical FOV in degrees
     val imageWidth: Int,
-    val imageHeight: Int
+    val imageHeight: Int,
+    val sensorOrientation: Int = 0  // Camera sensor mounting rotation (degrees), typically 90 or 270
 )

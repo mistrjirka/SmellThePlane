@@ -41,6 +41,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
+import android.util.Log
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.mistrjirka.smelltheplane.ui.theme.SmellThePlaneTheme
@@ -59,10 +60,10 @@ class MainActivity : ComponentActivity(), SensorEventListener, LocationListener 
     private val deviceId = UUID.randomUUID().toString()
 
     // Sensor Data
-    private var currentOrientation = OrientationData(Quaternion(0f, 0f, 0f, 1f), EulerAngles(0f, 0f, 0f))
+    @Volatile private var currentOrientation = OrientationData(Quaternion(0f, 0f, 0f, 1f), EulerAngles(0f, 0f, 0f))
     
     // Location Data
-    private var currentLocation = LocationData(0.0, 0.0, 0.0, 0f)
+    @Volatile private var currentLocation = LocationData(0.0, 0.0, 0.0, 0f)
 
     // Camera Executor
     private val cameraExecutor = Executors.newSingleThreadExecutor()
@@ -74,6 +75,7 @@ class MainActivity : ComponentActivity(), SensorEventListener, LocationListener 
     // Camera FOV (calculated from Camera2 API)
     private var cameraFovHorizontal: Float = 60f
     private var cameraFovVertical: Float = 45f
+    private var cameraSensorOrientation: Int = 0  // SENSOR_ORIENTATION from Camera2 API
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -185,8 +187,11 @@ class MainActivity : ComponentActivity(), SensorEventListener, LocationListener 
                 cameraFovHorizontal = Math.toDegrees(fovHorizontalRad).toFloat()
                 cameraFovVertical = Math.toDegrees(fovVerticalRad).toFloat()
             }
-        } catch (e: Exception) {
-            // Keep default values if calculation fails
+            
+            // Read sensor orientation (physical mounting rotation of the camera sensor)
+            cameraSensorOrientation = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
+            } catch (e: Exception) {
+            Log.w("SmellThePlane", "Failed to calculate camera FOV, using defaults", e)
         }
     }
 
@@ -234,6 +239,7 @@ class MainActivity : ComponentActivity(), SensorEventListener, LocationListener 
                 this, cameraSelector, preview, imageAnalyzer
             )
         } catch (exc: Exception) {
+            Log.e("SmellThePlane", "Failed to start camera", exc)
         }
     }
 
@@ -247,7 +253,8 @@ class MainActivity : ComponentActivity(), SensorEventListener, LocationListener 
                 fovHorizontal = cameraFovHorizontal,
                 fovVertical = cameraFovVertical,
                 imageWidth = width,
-                imageHeight = height
+                imageHeight = height,
+                sensorOrientation = cameraSensorOrientation
             )
         )
         motionServer.updateData(data, imageBytes)
@@ -257,6 +264,7 @@ class MainActivity : ComponentActivity(), SensorEventListener, LocationListener 
             if (!isChangingConfigurations) {
                 motionServer.stop()
             }
+            cameraExecutor.shutdown()
         }
 
     // SensorEventListener
